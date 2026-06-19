@@ -103,6 +103,17 @@ function writeEnvOnecliUrl(url: string): void {
   writeEnvVar('ONECLI_URL', url);
 }
 
+// Read a var from .env. Setup runs via `tsx setup/auto.ts` with no dotenv
+// loader, so values persisted in .env are NOT in process.env — read them
+// explicitly when the installer (a child process) needs them in its env.
+function readEnvVar(name: string): string | null {
+  const envFile = path.join(process.cwd(), '.env');
+  if (!fs.existsSync(envFile)) return null;
+  const content = fs.readFileSync(envFile, 'utf-8');
+  const m = content.match(new RegExp(`^${name}=(.*)$`, 'm'));
+  return m ? m[1].trim() : null;
+}
+
 // The SANCTIONED gateway version: fresh installs pin to it. Upgrading an
 // existing gateway is NOT done here — the gateway is a separate out-of-band
 // component, and the migrator is the user's coding agent following
@@ -152,8 +163,18 @@ function installOnecli(): { stdout: string; ok: boolean } {
   const cleanup = removeLegacyOnecliContainers();
   if (cleanup) stdout += cleanup + '\n';
 
+  // The installer can't always auto-determine a bind address (VMs, podman,
+  // multi-interface hosts) and aborts asking for ONECLI_BIND_HOST. Honor it
+  // from process.env first, then .env, and pass it into the installer's env.
+  const bindHost = process.env.ONECLI_BIND_HOST?.trim() || readEnvVar('ONECLI_BIND_HOST');
+  const installEnv = bindHost ? { ...process.env, ONECLI_BIND_HOST: bindHost } : undefined;
+  if (bindHost) stdout += `Using ONECLI_BIND_HOST=${bindHost}\n`;
+
   // Gateway install (docker-compose based, no rate-limit concerns).
-  const gw = runInstall(`export ONECLI_VERSION=${ONECLI_GATEWAY_VERSION} && curl -fsSL onecli.sh/install | sh`);
+  const gw = runInstall(
+    `export ONECLI_VERSION=${ONECLI_GATEWAY_VERSION} && curl -fsSL onecli.sh/install | sh`,
+    installEnv,
+  );
   stdout += gw.stdout;
   if (!gw.ok) {
     log.error('OneCLI gateway install failed', { stderr: gw.stderr });
@@ -169,11 +190,12 @@ function installOnecli(): { stdout: string; ok: boolean } {
   return { stdout, ok: true };
 }
 
-function runInstall(cmd: string): { stdout: string; stderr?: string; ok: boolean } {
+function runInstall(cmd: string, env?: NodeJS.ProcessEnv): { stdout: string; stderr?: string; ok: boolean } {
   try {
     const stdout = execSync(cmd, {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
+      ...(env ? { env } : {}),
     });
     return { stdout, ok: true };
   } catch (err) {
@@ -397,10 +419,14 @@ export async function run(args: string[]): Promise<void> {
   log.info('Installing OneCLI gateway and CLI');
   const res = installOnecli();
   if (!res.ok) {
+    const needsBindHost = /bind address|ONECLI_BIND_HOST/i.test(res.stdout);
     emitStatus('ONECLI', {
       INSTALLED: false,
       STATUS: 'failed',
       ERROR: 'install_failed',
+      HINT: needsBindHost
+        ? 'OneCLI couldn\'t auto-pick a bind address. Set ONECLI_BIND_HOST=<host-ip> in .env (or export it) and retry.'
+        : 'Make sure curl is installed and ~/.local/bin is writable, then retry.',
       LOG: 'logs/setup.log',
     });
     process.exit(1);

@@ -11,13 +11,67 @@ import { log } from './log.js';
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
+/**
+ * Detect whether the `docker` binary is actually rootless podman.
+ *
+ * Rootless podman emulates the Docker CLI but remaps UIDs through a user
+ * namespace: the container's `node` user (UID 1000) maps to a high subuid on
+ * the host, not to the host's own UID. Cached after first probe.
+ */
+let _isRootlessPodman: boolean | undefined;
+export function isRootlessPodman(): boolean {
+  if (_isRootlessPodman !== undefined) return _isRootlessPodman;
+  try {
+    const out = execSync(`${CONTAINER_RUNTIME_BIN} info --format '{{.Host.Security.Rootless}}'`, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+      timeout: 10000,
+    });
+    _isRootlessPodman = out.trim() === 'true';
+  } catch {
+    _isRootlessPodman = false;
+  }
+  return _isRootlessPodman;
+}
+
+/**
+ * User-namespace args for spawning a container.
+ *
+ * Under rootless podman the container's `node` user (UID 1000) would map to a
+ * host subuid and therefore cannot write the host-owned session DB files
+ * (mode 0644) — the agent-runner dies with "attempt to write a readonly
+ * database". `--userns=keep-id` maps the host user 1:1 into the container so
+ * `node` (UID 1000) == host UID 1000 and the bind mounts are writable. Real
+ * Docker maps UID 1000 directly, so no flag is needed (returns []).
+ */
+export function userNamespaceArgs(): string[] {
+  return isRootlessPodman() ? ['--userns=keep-id'] : [];
+}
+
+/**
+ * Non-default slirp4netns CIDR for rootless-podman containers. The default
+ * (10.0.2.0/24) collides with common host NAT ranges (e.g. VirtualBox NAT),
+ * which breaks host reachability. `.2` of this range is slirp's host-loopback
+ * address — it forwards to the host's 127.0.0.1.
+ */
+const ROOTLESS_SLIRP_CIDR = '10.99.0.0/24';
+const ROOTLESS_HOST_LOOPBACK = '10.99.0.2';
+
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
-  // On Linux, host.docker.internal isn't built-in — add it explicitly
-  if (os.platform() === 'linux') {
-    return ['--add-host=host.docker.internal:host-gateway'];
+  if (os.platform() !== 'linux') return [];
+  // Rootless podman: the container can't reach the host on the bridge gateway
+  // or the host's external IP — only via slirp4netns's host-loopback mapping.
+  // Point host.docker.internal at that address; host services the container
+  // needs (e.g. the OneCLI gateway) must therefore bind to the host's 127.0.0.1.
+  if (isRootlessPodman()) {
+    return [
+      `--network=slirp4netns:allow_host_loopback=true,cidr=${ROOTLESS_SLIRP_CIDR}`,
+      `--add-host=host.docker.internal:${ROOTLESS_HOST_LOOPBACK}`,
+    ];
   }
-  return [];
+  // On Linux Docker, host.docker.internal isn't built-in — add it explicitly
+  return ['--add-host=host.docker.internal:host-gateway'];
 }
 
 /** Returns CLI args for a readonly bind mount. */

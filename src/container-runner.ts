@@ -22,7 +22,13 @@ import {
 import { materializeContainerJson } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars } from './db/container-configs.js';
-import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import {
+  CONTAINER_RUNTIME_BIN,
+  hostGatewayArgs,
+  readonlyMountArgs,
+  stopContainer,
+  userNamespaceArgs,
+} from './container-runtime.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -461,6 +467,11 @@ async function buildContainerArgs(
     args.push('--user', `${hostUid}:${hostGid}`);
     args.push('-e', 'HOME=/home/node');
   }
+  // Rootless podman remaps the container's `node` user (UID 1000) to a host
+  // subuid, so it can't write the host-owned session DB files. keep-id maps the
+  // host user 1:1 into the container so the bind mounts are writable. No-op on
+  // real Docker.
+  args.push(...userNamespaceArgs());
 
   // Volume mounts
   for (const mount of mounts) {
