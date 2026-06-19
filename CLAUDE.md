@@ -260,6 +260,16 @@ This project uses pnpm with `minimumReleaseAge: 4320` (3 days) in `pnpm-workspac
 - **`onlyBuiltDependencies`**: Never add packages to this list without human approval — build scripts execute arbitrary code during install.
 - **`pnpm install --frozen-lockfile`** should be used in CI, automation, and container builds. Never run bare `pnpm install` in those contexts.
 
+## Multi-Agent Swarm (single shared Telegram bot)
+
+This install runs a parallel agent swarm fed by **one** Telegram bot token (no per-agent bot identities). Findings from configuring it:
+
+- **Parallelism is inherent to v2.** The host spawns one Docker container per session, so multiple agent groups run concurrently and isolated. A swarm = multiple agent groups (isolation level 3 in [docs/isolation-model.md](docs/isolation-model.md)), wired via `ncl`.
+- **One chat can fan out to many agents** (v1 could not). Wire the same `messaging_group` to multiple agent groups; the router evaluates each wiring's engage rule independently and wakes every match in its own container. Keep them from all talking at once with `engage_mode=pattern` + a mention regex (e.g. `engage_pattern '(?i)@research'`); use `engage_pattern '.'` for an always-on agent. Set `ignored_message_policy=accumulate` so an agent sees the messages it didn't trigger on as background context.
+- **Many chats, one bot** is the other flavor: add the bot to several Telegram group chats (each a distinct `messaging_group` keyed by its negative chat ID) and wire each to a different agent group.
+- **Limitation of one shared bot:** your own DM is a single chat, so multiple *separate* DM conversations each routing to a different agent isn't possible — that's what distinct bot tokens gave v1. Fan-out-by-mention within the one DM is the substitute.
+- **Multi-bot (per-agent identities) is a code change, not config.** The DB + adapter registry already support N instances of one platform (the `instance` dimension, migration `016-messaging-group-instance.ts`; instance-keyed dispatch in `src/channels/channel-registry.ts`). But the shipped Telegram adapter (`src/channels/telegram.ts`) reads a single `TELEGRAM_BOT_TOKEN` and registers exactly one `telegram` instance. Distinct bots would require extending it to register one adapter instance per token, each with its own `instance` name.
+
 ## Docs Index
 
 | Doc | Purpose |
