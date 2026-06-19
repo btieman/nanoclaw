@@ -17,6 +17,7 @@ import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, st
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
+import { notifyOwnersOnline } from './startup-notify.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
@@ -172,6 +173,9 @@ async function main(): Promise<void> {
   await startCliServer();
 
   log.info('NanoClaw running');
+
+  // 8. DM owners that the host is online (best-effort, non-blocking).
+  void notifyOwnersOnline();
 }
 
 /** Graceful shutdown. */
