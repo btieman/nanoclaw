@@ -59,13 +59,15 @@ For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than t
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Entry point: init DB, migrations, channel adapters, delivery polls, sweep, shutdown |
+| `src/index.ts` | Entry point: init DB, migrations, channel adapters, delivery polls, sweep, shutdown; on boot also starts the optional dashboard and fires owner online-ping + agent pre-warm |
 | `src/router.ts` | Inbound routing: messaging group → agent group → session → `inbound.db` → wake |
 | `src/delivery.ts` | Polls `outbound.db`, delivers via adapter, handles system actions (schedule, approvals, etc.) |
 | `src/host-sweep.ts` | 60s sweep: `processing_ack` sync, stale detection, due-message wake, recurrence |
 | `src/session-manager.ts` | Resolves sessions; opens `inbound.db` / `outbound.db`; manages heartbeat path |
 | `src/container-runner.ts` | Spawns per-agent-group Docker containers with session DB + outbox mounts, OneCLI `ensureAgent` |
-| `src/container-runtime.ts` | Runtime selection (Docker vs Apple containers), orphan cleanup |
+| `src/container-runtime.ts` | Runtime selection (Docker vs Apple containers), orphan cleanup; **rootless-podman detection** → adds `--userns=keep-id` + a non-colliding slirp4netns host-loopback so containers can write session DBs and reach the host gateway |
+| `src/startup-notify.ts` | On host start (wired at end of `main()`): DM owners "online" (ping #1), then inject a warm-up message + spawn each owner-DM agent container; the agent's reply is the "ready" ping (#2). Heartbeat-watched fallback. Best-effort, never fatal. **Custom — not upstream.** |
+| `src/dashboard-pusher.ts` | Optional monitoring dashboard pusher (installed via `/add-dashboard`): posts a DB/state snapshot every 60s + tails logs. No-ops without `DASHBOARD_SECRET`. |
 | `src/modules/permissions/access.ts` | `canAccessAgentGroup` — owner / global admin / scoped admin / member resolution against `user_roles` + `agent_group_members` |
 | `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval`, approval-handler registry |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
@@ -260,6 +262,15 @@ This project uses pnpm with `minimumReleaseAge: 4320` (3 days) in `pnpm-workspac
 - **`onlyBuiltDependencies`**: Never add packages to this list without human approval — build scripts execute arbitrary code during install.
 - **`pnpm install --frozen-lockfile`** should be used in CI, automation, and container builds. Never run bare `pnpm install` in those contexts.
 
+## Startup behavior (custom — this install)
+
+On every host start, `src/startup-notify.ts` (called at the end of `main()` in `src/index.ts`) runs two best-effort, non-fatal steps:
+
+1. **Owner online-ping (#1):** DMs every owner directly through the channel adapter (no agent/container needed) that the host is up and warming.
+2. **Pre-warm + ready-ping (#2):** injects a warm-up message into each owner-DM session and spawns its container so the agent boots and the SDK warms in the background. The agent's short reply lands in the DM as the "ready" ping; the owner's first *real* request then skips the container cold start. A heartbeat watcher (`heartbeatPath`) sends a fallback notice if a container never comes up within 5 min.
+
+**Expect on every boot:** a container is auto-spawned (one small model round-trip for the warm-up) and each owner receives **two DMs**. This is not upstream behavior — if it's ever unwanted, remove the `notifyOwnersOnline()` call in `src/index.ts` and `src/startup-notify.ts`.
+
 ## Multi-Agent Swarm (single shared Telegram bot)
 
 This install runs a parallel agent swarm fed by **one** Telegram bot token (no per-agent bot identities). Findings from configuring it:
@@ -269,6 +280,7 @@ This install runs a parallel agent swarm fed by **one** Telegram bot token (no p
 - **Many chats, one bot** is the other flavor: add the bot to several Telegram group chats (each a distinct `messaging_group` keyed by its negative chat ID) and wire each to a different agent group.
 - **Limitation of one shared bot:** your own DM is a single chat, so multiple *separate* DM conversations each routing to a different agent isn't possible — that's what distinct bot tokens gave v1. Fan-out-by-mention within the one DM is the substitute.
 - **Multi-bot (per-agent identities) is a code change, not config.** The DB + adapter registry already support N instances of one platform (the `instance` dimension, migration `016-messaging-group-instance.ts`; instance-keyed dispatch in `src/channels/channel-registry.ts`). But the shipped Telegram adapter (`src/channels/telegram.ts`) reads a single `TELEGRAM_BOT_TOKEN` and registers exactly one `telegram` instance. Distinct bots would require extending it to register one adapter instance per token, each with its own `instance` name.
+- **This install's implementation:** the `wolfram-research` agent group (folder under `groups/*`, gitignored) is a Wolfram Research reporting orchestrator. It runs its 16-persona report teams as ephemeral SDK `Task` sub-agents (isolated context per persona → no single-window context blow-up), synthesizes self-contained HTML, and emails reports via SMTP (`python3` reading `groups/wolfram-research/email-config.json`). Triggered manually from the owner DM; no scheduling yet. See that group's `CLAUDE.local.md` for the full operating contract.
 
 ## Docs Index
 
