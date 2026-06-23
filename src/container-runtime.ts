@@ -21,17 +21,53 @@ export const CONTAINER_RUNTIME_BIN = 'docker';
 let _isRootlessPodman: boolean | undefined;
 export function isRootlessPodman(): boolean {
   if (_isRootlessPodman !== undefined) return _isRootlessPodman;
+
+  // Fast, offline detection first. `docker --version` prints "podman version X"
+  // when the `docker` CLI is the podman wrapper. We deliberately avoid leading
+  // with `docker info`: it can take >10s on a loaded host (e.g. during boot,
+  // or while a container is crash-looping every minute), and a timed-out probe
+  // used to be cached as `false` — disabling keep-id for the whole process and
+  // crash-looping every container on "attempt to write a readonly database".
+  // `--version` is near-instant and needs no running daemon/service.
+  let isPodman = false;
   try {
-    const out = execSync(`${CONTAINER_RUNTIME_BIN} info --format '{{.Host.Security.Rootless}}'`, {
+    const ver = execSync(`${CONTAINER_RUNTIME_BIN} --version`, {
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf-8',
       timeout: 10000,
     });
-    _isRootlessPodman = out.trim() === 'true';
+    isPodman = /podman/i.test(ver);
   } catch {
-    _isRootlessPodman = false;
+    // fall through to the authoritative `info` probe below
   }
-  return _isRootlessPodman;
+
+  // Rootless podman == podman invoked by a non-root user. That is the only
+  // case that needs keep-id; root podman maps UID 1:1 like real Docker. This
+  // inference is reliable and avoids the slow `info` call entirely.
+  if (isPodman) {
+    const uid = process.getuid?.();
+    if (uid !== undefined && uid !== 0) {
+      _isRootlessPodman = true;
+      return _isRootlessPodman;
+    }
+  }
+
+  // Authoritative fallback (non-podman CLIs, root podman, odd setups). A
+  // timeout/error here must NOT poison the cache with `false` — leave it unset
+  // so a later spawn re-probes once the host is less loaded. Generous timeout.
+  try {
+    const out = execSync(`${CONTAINER_RUNTIME_BIN} info --format '{{.Host.Security.Rootless}}'`, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+      timeout: 30000,
+    });
+    _isRootlessPodman = out.trim() === 'true';
+    return _isRootlessPodman;
+  } catch {
+    // Best-effort, uncached: better to skip keep-id this once than to lock in
+    // a wrong `false` for the process lifetime.
+    return isPodman;
+  }
 }
 
 /**
